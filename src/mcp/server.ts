@@ -1061,7 +1061,7 @@ export type HttpServerHandle = {
  */
 export async function startMcpHttpServer(
   port: number,
-  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[] } & McpStartupOptions) = {},
+  options: ({ quiet?: boolean; host?: string; allowedOrigins?: string[]; allowedHosts?: string[]; warmModels?: boolean } & McpStartupOptions) = {},
 ): Promise<HttpServerHandle> {
   // See startMcpServer() for the rationale — flip production mode here so the
   // HTTP transport resolves the real database path, without leaking state into
@@ -1071,7 +1071,17 @@ export async function startMcpHttpServer(
   const store = await createStore({
     dbPath: options.dbPath ?? getDefaultDbPath(),
     ...(existsSync(configPath) ? { configPath } : {}),
+    keepModelsWarm: options.warmModels,
   });
+
+  if (options.warmModels) {
+    try {
+      await store.internal.llm!.warmUp();
+    } catch (error) {
+      await store.close();
+      throw error;
+    }
+  }
 
   // Pre-fetch default collection names for REST endpoint
   const defaultCollectionNames = await store.getDefaultCollectionNames();

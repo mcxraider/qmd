@@ -893,6 +893,17 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
+  /** Verify all three models can serve a request before an HTTP daemon reports ready. */
+  async warmUp(): Promise<void> {
+    const embedding = await this.embed("QMD startup readiness check");
+    if (!embedding?.embedding.length) throw new Error("Embedding model warm-up failed");
+    const generation = await this.generate("QMD startup readiness check", { maxTokens: 1 });
+    if (!generation?.done) throw new Error("Query expansion model warm-up failed");
+    await this.expandQuery("QMD startup readiness check", { strict: true });
+    const ranking = await this.rerank("readiness", [{ file: "warm-up", text: "QMD readiness check" }]);
+    if (ranking.model === "fallback") throw new Error("Reranking model warm-up failed");
+  }
+
   /**
    * Reset the inactivity timer. Called after each model operation.
    * When timer fires, models are unloaded to free memory (if no active sessions).
@@ -1627,7 +1638,7 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
-  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean } = {}): Promise<Queryable[]> {
+  async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, strict?: boolean } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1706,6 +1717,7 @@ export class LlamaCpp implements LLM {
       // Filter out lex entries if not requested
       const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
       if (filtered.length > 0) return filtered;
+      if (options.strict) throw new Error("Query expansion model produced no usable queries");
 
       const fallback: Queryable[] = [
         { type: 'hyde', text: `Information about ${query}` },
@@ -1714,6 +1726,7 @@ export class LlamaCpp implements LLM {
       ];
       return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
     } catch (error) {
+      if (options.strict) throw error;
       console.error("Structured query expansion failed:", error);
       // Fallback to original query
       const fallback: Queryable[] = [{ type: 'vec', text: query }];

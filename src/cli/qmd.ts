@@ -226,7 +226,7 @@ function getActiveIndexName(): string {
   return currentIndexName;
 }
 
-function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string } {
+function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string; readyPath: string } {
   const cacheDir = process.env.XDG_CACHE_HOME
     ? resolve(process.env.XDG_CACHE_HOME, "qmd")
     : resolve(homedir(), ".cache", "qmd");
@@ -235,6 +235,7 @@ function mcpDaemonPaths(): { cacheDir: string; pidPath: string; logPath: string 
     cacheDir,
     pidPath: resolve(cacheDir, pidFile),
     logPath: resolve(cacheDir, logFile),
+    readyPath: resolve(cacheDir, `${pidFile}.ready`),
   };
 }
 
@@ -560,13 +561,15 @@ async function showStatus(): Promise<void> {
   console.log(`Size:  ${formatBytes(indexSize)}`);
 
   // MCP daemon status (check PID file liveness; scoped per --index)
-  const { pidPath: mcpPidPath } = mcpDaemonPaths();
+  const { pidPath: mcpPidPath, readyPath: mcpReadyPath } = mcpDaemonPaths();
   if (existsSync(mcpPidPath)) {
     const mcpPid = parseInt(readFileSync(mcpPidPath, "utf-8").trim());
     if (isQmdMcpPid(mcpPid)) {
-      console.log(`MCP:   ${c.green}running${c.reset} (PID ${mcpPid})`);
+      const ready = existsSync(mcpReadyPath) && readFileSync(mcpReadyPath, "utf-8").trim() === String(mcpPid);
+      console.log(`MCP:   ${ready ? `${c.green}running` : `${c.yellow}starting`}${c.reset} (PID ${mcpPid})`);
     } else {
       try { unlinkSync(mcpPidPath); } catch { /* ignore */ }
+      try { unlinkSync(mcpReadyPath); } catch { /* ignore */ }
       // Stale / recycled PID file cleaned up silently
     }
   }
@@ -5070,7 +5073,7 @@ if (isMain) {
 
       // Cache dir for PID/log files — scoped per --index so named daemons
       // do not collide with the default index (#772).
-      const { cacheDir, pidPath, logPath } = mcpDaemonPaths();
+      const { cacheDir, pidPath, logPath, readyPath } = mcpDaemonPaths();
 
       // Subcommands take priority over flags
       if (sub === "stop") {
@@ -5081,15 +5084,18 @@ if (isMain) {
         const pid = parseInt(readFileSync(pidPath, "utf-8").trim());
         if (!isQmdMcpPid(pid)) {
           try { unlinkSync(pidPath); } catch { /* ignore */ }
+          try { unlinkSync(readyPath); } catch { /* ignore */ }
           console.log("Cleaned up stale PID file (server was not running).");
           process.exit(0);
         }
         try {
           process.kill(pid, "SIGTERM");
           unlinkSync(pidPath);
+          try { unlinkSync(readyPath); } catch { /* ignore */ }
           console.log(`Stopped QMD MCP server (PID ${pid}).`);
         } catch {
           try { unlinkSync(pidPath); } catch { /* ignore */ }
+          try { unlinkSync(readyPath); } catch { /* ignore */ }
           console.log("Cleaned up stale PID file (server was not running).");
         }
         process.exit(0);
@@ -5113,6 +5119,7 @@ if (isMain) {
             // Stale or recycled PID file — remove and continue
             try { unlinkSync(pidPath); } catch { /* ignore */ }
           }
+          try { unlinkSync(readyPath); } catch { /* ignore */ }
 
           mkdirSync(cacheDir, { recursive: true });
           const logFd = openSync(logPath, "w"); // truncate — fresh log per daemon run
@@ -5130,13 +5137,34 @@ if (isMain) {
               // Explicit resolved DB path so the child does not depend on
               // re-parsing --index (and cannot inherit a stale INDEX_PATH).
               INDEX_PATH: getDbPath(),
+              QMD_MCP_DAEMON_READY_FILE: readyPath,
             },
           });
+          let spawnError: Error | undefined;
+          child.once("error", error => { spawnError = error; });
           child.unref();
           closeSync(logFd); // parent's copy; child inherited the fd
 
+          if (!child.pid) {
+            console.error("Could not start QMD MCP daemon.");
+            process.exit(1);
+          }
+
           writeFileSync(pidPath, String(child.pid));
-          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid})`);
+          const deadline = Date.now() + 10 * 60 * 1000;
+          const isReady = () => existsSync(readyPath) && readFileSync(readyPath, "utf-8").trim() === String(child.pid);
+          while (Date.now() < deadline && child.exitCode === null && child.signalCode === null && !spawnError && !isReady()) {
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+          if (!isReady()) {
+            if (child.exitCode === null && child.signalCode === null && !spawnError) {
+              try { process.kill(child.pid, "SIGTERM"); } catch { /* already exited */ }
+            }
+            try { unlinkSync(pidPath); } catch { /* ignore */ }
+            console.error(`QMD MCP daemon failed to warm up${spawnError ? `: ${spawnError.message}` : ""}. Check ${logPath}`);
+            process.exit(1);
+          }
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid}); all three models ready`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
@@ -5152,12 +5180,18 @@ if (isMain) {
             if (!existsSync(pidPath)) return;
             const written = parseInt(readFileSync(pidPath, "utf-8").trim());
             if (written === process.pid) unlinkSync(pidPath);
+            if (existsSync(readyPath) && readFileSync(readyPath, "utf-8").trim() === String(process.pid)) unlinkSync(readyPath);
           } catch { /* ignore */ }
         };
         process.on("exit", unlinkOwnPidfile);
         const { startMcpHttpServer } = await import("../mcp/server.js");
         try {
-          await startMcpHttpServer(port, { dbPath: getDbPath(), host });
+          const daemonReadyFile = process.env.QMD_MCP_DAEMON_READY_FILE;
+          await startMcpHttpServer(port, {
+            dbPath: getDbPath(), host,
+            warmModels: !!daemonReadyFile && !(process.env.CI === "true" && process.env.QMD_MCP_SKIP_WARMUP === "1"),
+          });
+          if (daemonReadyFile) writeFileSync(daemonReadyFile, String(process.pid));
         } catch (e: unknown) {
           if (typeof e === "object" && e !== null && "code" in e && e.code === "EADDRINUSE") {
             console.error(`Port ${port} already in use. Try a different port with --port.`);
