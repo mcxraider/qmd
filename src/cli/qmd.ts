@@ -5153,11 +5153,11 @@ if (isMain) {
           writeFileSync(pidPath, String(child.pid));
           const deadline = Date.now() + 10 * 60 * 1000;
           const isReady = () => existsSync(readyPath) && readFileSync(readyPath, "utf-8").trim() === String(child.pid);
-          while (Date.now() < deadline && child.exitCode === null && !spawnError && !isReady()) {
+          while (Date.now() < deadline && child.exitCode === null && child.signalCode === null && !spawnError && !isReady()) {
             await new Promise(resolve => setTimeout(resolve, 200));
           }
           if (!isReady()) {
-            if (child.exitCode === null && !spawnError) {
+            if (child.exitCode === null && child.signalCode === null && !spawnError) {
               try { process.kill(child.pid, "SIGTERM"); } catch { /* already exited */ }
             }
             try { unlinkSync(pidPath); } catch { /* ignore */ }
