@@ -143,8 +143,14 @@ qmd mcp --http --host 0.0.0.0     # bind all interfaces (e.g. container probes)
 # Background daemon
 qmd mcp --http --daemon           # start, writes PID to ~/.cache/qmd/mcp.pid
 qmd mcp stop                      # stop via PID file
-qmd status                        # shows "MCP: running (PID ...)" when active
+qmd status                        # shows "MCP: starting" until all three models are ready
 ```
+
+Daemon startup warms the configured embedding, query expansion, and reranking
+models before reporting success or serving requests. It keeps the models and
+reusable contexts loaded while running, so startup takes longer and uses more
+memory. If warm-up fails, startup exits nonzero; inspect `~/.cache/qmd/mcp.log`
+for the error. Foreground HTTP and stdio MCP servers retain lazy model loading.
 
 The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server

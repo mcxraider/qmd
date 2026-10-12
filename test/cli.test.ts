@@ -58,6 +58,7 @@ async function runQmd(
       QMD_CONFIG_DIR: configDir, // Use test config directory
       PWD: workingDir, // Must explicitly set PWD since getPwd() checks this
       QMD_DOCTOR_DEVICE_PROBE: "0", // Keep integration tests deterministic on CI hosts without usable GPU backends.
+      QMD_MCP_SKIP_WARMUP: "1", // Daemon lifecycle tests use fixture indexes without models.
       ...options.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -2996,6 +2997,7 @@ describe("mcp http daemon", () => {
     ]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain(`http://localhost:${port}/mcp`);
+    expect(stdout).toContain("all three models ready");
 
     // PID file should exist
     expect(existsSync(pidPath())).toBe(true);
@@ -3006,12 +3008,35 @@ describe("mcp http daemon", () => {
     // Server should be reachable
     const ready = await waitForServer(port);
     expect(ready).toBe(true);
+    const status = await runDaemonQmd(["status"]);
+    expect(status.stdout).toContain("MCP:   running");
 
     // Clean up
     process.kill(pid, "SIGTERM");
     await sleep(500);
     try { unlinkSync(pidPath()); } catch {}
   });
+
+  test("--daemon does not report ready when a model fails to load", async () => {
+    const port = randomPort();
+    const { stdout, stderr, exitCode } = await runQmd(
+      ["mcp", "--http", "--daemon", "--port", String(port)],
+      {
+        dbPath: daemonDbPath,
+        configDir: daemonConfigDir,
+        env: {
+          XDG_CACHE_HOME: daemonCacheDir,
+          QMD_MCP_SKIP_WARMUP: "0",
+          QMD_EMBED_MODEL: "/does/not/exist.gguf",
+        },
+      },
+    );
+    expect(exitCode).toBe(1);
+    expect(stdout).not.toContain("Started on");
+    expect(stderr).toContain("failed to warm up");
+    expect(existsSync(pidPath())).toBe(false);
+    expect(existsSync(`${pidPath()}.ready`)).toBe(false);
+  }, 60000);
 
   test("stop kills daemon and removes PID file", async () => {
     const port = randomPort();

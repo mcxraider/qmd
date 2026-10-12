@@ -291,6 +291,8 @@ export interface StoreOptions {
   configPath?: string;
   /** Inline collection config (mutually exclusive with `configPath`) */
   config?: CollectionConfig;
+  /** Keep model weights and reusable contexts resident for a warm HTTP daemon. */
+  keepModelsWarm?: boolean;
 }
 
 /**
@@ -476,8 +478,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
-    inactivityTimeoutMs: 5 * 60 * 1000,
-    disposeModelsOnInactivity: true,
+    inactivityTimeoutMs: options.keepModelsWarm ? 0 : 5 * 60 * 1000,
+    disposeModelsOnInactivity: !options.keepModelsWarm,
   });
   internal.llm = llm;
 
