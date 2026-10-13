@@ -108,6 +108,7 @@ import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM } from "../llm-remote.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -179,16 +180,42 @@ function getStore(): ReturnType<typeof createStore> {
       syncConfigToDb(store.db, config);
       // Untrusted project-local custom model URIs must not be loaded; status
       // still displays the YAML values via resolveModelsForCli (#889).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
+      const trusted = localConfigIsFullyTrusted();
+      const modelsForLlm = trusted ? activeModels : resolveModels();
+      const localLlm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
         rerankModel: modelsForLlm.rerank,
       });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
-    } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // The local instance stays the global default: it provides the tokenizer
+      // (chunking) and device probing (doctor) regardless of backend.
+      setDefaultLlamaCpp(localLlm);
+
+      // Route embeddings + query-expansion through a remote API when a trusted
+      // provider is configured; reranking stays on `localLlm`.
+      const provider = trusted ? config.models?.provider : undefined;
+      if (provider?.base_url) {
+        const apiKey = process.env.QMD_API_KEY;
+        if (!apiKey) {
+          throw new Error("models.provider is configured but QMD_API_KEY is not set");
+        }
+        store.llm = new RemoteLLM({
+          baseURL: provider.base_url,
+          apiKey,
+          embedModel: provider.embed ?? "cohere.embed-v4:0",
+          generateModel: provider.generate ?? "bedrock.claude-sonnet-5-5",
+          dimensions: provider.embed_dimensions ?? 1536,
+          localForRerank: localLlm,
+        });
+      } else {
+        store.llm = localLlm;
+      }
+    } catch (error) {
+      // Missing config is optional, but a configured remote backend must never
+      // silently fall back to local embeddings when its credential is absent.
+      if (error instanceof Error && error.message === "models.provider is configured but QMD_API_KEY is not set") {
+        throw error;
+      }
     }
   }
   return store;
@@ -690,10 +717,11 @@ async function showStatus(): Promise<void> {
       return match ? `https://huggingface.co/${match[1]}` : uri;
     };
     const activeModels = resolveModelsForCli();
+    const activeLlm = store?.llm;
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
-    console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
+    console.log(`  Embedding:   ${hfLink(activeLlm?.embedModelName ?? activeModels.embed)}`);
+    console.log(`  Reranking:   ${hfLink(activeLlm?.rerankModelName ?? activeModels.rerank)}`);
+    console.log(`  Generation:  ${hfLink(activeLlm?.generateModelName ?? activeModels.generate)}`);
   }
 
 
@@ -2366,8 +2394,23 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
   }
 }
 
-export function resolveEmbedModelForCli(): string {
+/**
+ * The embed-model name the active store will actually embed/query with.
+ * When a remote provider is configured, the store's backend is a RemoteLLM
+ * whose `embedModelName` is the provider model (e.g. cohere.embed-v4:0) — the
+ * embed and query paths must agree on this string or fingerprints won't match.
+ * Falls back to the configured local embed model when no store/provider.
+ */
+function activeEmbedModel(): string {
+  try {
+    const name = store?.llm?.embedModelName;
+    if (name) return name;
+  } catch { /* store not ready — fall through */ }
   return ensureModelsConfiguredForCli().embed;
+}
+
+export function resolveEmbedModelForCli(): string {
+  return activeEmbedModel();
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2391,12 +2434,15 @@ function resolveModelsForRuntime(): { embed: string; generate: string; rerank: s
 }
 
 async function vectorIndex(
-  model: string = resolveEmbedModelForCli(),
+  model?: string,
   force: boolean = false,
   batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  // Resolve AFTER getStore() so a configured remote provider's embed model
+  // (e.g. cohere.embed-v4:0) is used — matching the query path's fingerprint.
+  model = model ?? activeEmbedModel();
 
   // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
@@ -4475,7 +4521,23 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
+
+  const provider = configModels.provider;
+  if (provider?.base_url) {
+    const keyPresent = !!process.env.QMD_API_KEY;
+    doctorCheck(
+      "remote provider",
+      keyPresent,
+      `${provider.base_url} — embed: ${provider.embed ?? "cohere.embed-v4:0"} @ ${provider.embed_dimensions ?? 1536}d, ` +
+        `generate: ${provider.generate ?? "bedrock.claude-sonnet-5-5"}; ` +
+        `QMD_API_KEY ${keyPresent ? "present" : "MISSING (set it to use the API)"}; rerank is local`,
+    );
+    if (!keyPresent) nextSteps.push("Set QMD_API_KEY to authenticate with the configured models.provider.");
+    // Only the rerank model lives on disk when a provider is active.
+    checkModelCache({ embed: activeModels.rerank, generate: activeModels.rerank, rerank: activeModels.rerank }, nextSteps);
+  } else {
+    checkModelCache(activeModels, nextSteps);
+  }
 
   await runDoctorDeviceChecks(nextSteps);
 
@@ -4974,7 +5036,7 @@ if (isMain) {
         // embed operates on a single collection; only the first value is used.
         const embedValidatedCollections = resolveCollectionFilter(cli.opts.collection, false);
         const embedCollection = embedValidatedCollections[0];
-        await vectorIndex(resolveModelsForRuntime().embed, !!cli.values.force, {
+        await vectorIndex(undefined, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
@@ -4990,11 +5052,12 @@ if (isMain) {
       await resolveLocalConfigTrust();
       const refresh = cli.values.refresh === undefined ? false : Boolean(cli.values.refresh);
       const activeModels = resolveModelsForRuntime();
-      const models = [
-        activeModels.embed,
-        activeModels.generate,
-        activeModels.rerank,
-      ];
+      // When a remote provider serves embed+generate, only the local rerank
+      // model is on disk — skip the API model names (not downloadable GGUFs).
+      const providerActive = !!loadConfig().models?.provider?.base_url && localConfigIsFullyTrusted();
+      const models = providerActive
+        ? [activeModels.rerank]
+        : [activeModels.embed, activeModels.generate, activeModels.rerank];
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,
