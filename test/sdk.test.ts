@@ -23,6 +23,7 @@ import {
   type ExpandQueryOptions,
 } from "../src/index.js";
 import { setDefaultLlamaCpp } from "../src/llm.js";
+import { getEmbeddingFingerprint } from "../src/store.js";
 import { VEC_COLLECTION_IDS_TABLE, VEC_ROWS_TABLE } from "../src/vec-layout.js";
 
 // =============================================================================
@@ -67,6 +68,35 @@ function freshDbPath(): string {
 // =============================================================================
 
 describe("createStore", () => {
+  test("uses remote embedding model for SDK and MCP index status", async () => {
+    const previousKey = process.env.QMD_API_KEY;
+    process.env.QMD_API_KEY = "test-key";
+    let store: QMDStore | undefined;
+    try {
+      store = await createStore({
+        dbPath: freshDbPath(),
+        config: {
+          collections: { docs: { path: docsDir, pattern: "**/*.md" } },
+          models: { provider: { base_url: "https://example.invalid/models", embed: "cohere.embed-v4:0" } },
+        },
+      });
+      const now = new Date().toISOString();
+      store.internal.insertContent("test-hash", "# Example", now);
+      store.internal.insertDocument("docs", "qmd://docs/example.md", "Example", "test-hash", now, now);
+      store.internal.db.prepare(`
+        INSERT INTO content_vectors (hash, seq, pos, model, embed_fingerprint, total_chunks, embedded_at)
+        VALUES (?, 0, 0, ?, ?, 1, ?)
+      `).run("test-hash", "cohere.embed-v4:0", getEmbeddingFingerprint("cohere.embed-v4:0"), now);
+
+      expect(store.internal.llm?.embedModelName).toBe("cohere.embed-v4:0");
+      expect((await store.getStatus()).needsEmbedding).toBe(0);
+    } finally {
+      await store?.close();
+      if (previousKey === undefined) delete process.env.QMD_API_KEY;
+      else process.env.QMD_API_KEY = previousKey;
+    }
+  });
+
   test("creates store with inline config", async () => {
     const store = await createStore({
       dbPath: freshDbPath(),
