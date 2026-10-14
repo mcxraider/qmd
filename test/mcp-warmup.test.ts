@@ -12,17 +12,17 @@ afterEach(async () => {
 });
 
 describe("HTTP model warm-up", () => {
-  test("checks embedding, generation, and reranking", async () => {
+  test("warms the reranker only — embed/generate stay lazy", async () => {
     const llm = new LlamaCpp();
     const embed = vi.spyOn(llm, "embed").mockResolvedValue({ embedding: [1], model: "embed" });
     const generate = vi.spyOn(llm, "generate").mockResolvedValue({ text: "ready", model: "generate", done: true });
     const expandQuery = vi.spyOn(llm, "expandQuery").mockResolvedValue([{ type: "vec", text: "readiness" }]);
     const rerank = vi.spyOn(llm, "rerank").mockResolvedValue({ results: [], model: "rerank" });
     await llm.warmUp();
-    expect(embed).toHaveBeenCalledOnce();
-    expect(generate).toHaveBeenCalledOnce();
-    expect(expandQuery).toHaveBeenCalledOnce();
     expect(rerank).toHaveBeenCalledOnce();
+    expect(embed).not.toHaveBeenCalled();
+    expect(generate).not.toHaveBeenCalled();
+    expect(expandQuery).not.toHaveBeenCalled();
     await llm.dispose();
   });
 

@@ -2436,7 +2436,7 @@ function resolveModelsForRuntime(): { embed: string; generate: string; rerank: s
 async function vectorIndex(
   model?: string,
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number; contextual?: boolean },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -2484,6 +2484,7 @@ async function vectorIndex(
       maxBatchBytes: batchOptions?.maxBatchBytes,
       chunkStrategy: batchOptions?.chunkStrategy,
       maxDurationMs: batchOptions?.maxDurationMs,
+      contextual: batchOptions?.contextual,
       onProgress: (info) => {
         if (info.totalBytes === 0) return;
         // Progress is measured by input bytes, not by chunks. The final chunk
@@ -3414,6 +3415,7 @@ function parseCLI() {
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      contextual: { type: "boolean" },  // prepend LLM-generated document context to each chunk before embedding
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3957,6 +3959,7 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("    --contextual                - Prepend LLM-generated document context to each chunk before embedding");
   console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
@@ -5042,6 +5045,7 @@ if (isMain) {
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
           maxDurationMs: embedMaxDurationMs,
+          contextual: !!cli.values.contextual,
         });
       } catch (error) {
         exitWithError(error);
@@ -5227,7 +5231,7 @@ if (isMain) {
             console.error(`QMD MCP daemon failed to warm up${spawnError ? `: ${spawnError.message}` : ""}. Check ${logPath}`);
             process.exit(1);
           }
-          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid}); all three models ready`);
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid}); reranker model ready`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }

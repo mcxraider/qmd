@@ -13,6 +13,15 @@
 
 ### Added
 
+- Contextual chunk enrichment. `qmd embed --contextual` prepends a short,
+  LLM-generated, document-level context to each chunk before embedding
+  (Anthropic contextual retrieval), improving recall for chunks that lost their
+  surrounding context. Opt-in — it adds one `generate()` call per chunk (run
+  with bounded concurrency) using the configured generate model (remote Claude
+  when a provider is set, otherwise the local model). Only the embedded vector
+  changes; stored bodies, chunk positions, and displayed snippets are untouched,
+  so no re-index of document content is needed. Re-embed with
+  `qmd embed --force --contextual` to apply it to an existing index.
 - Remote (API) model backend. Set a `models.provider` block in the index config
   with just `base_url` (optionally `embed`, `generate`, `embed_dimensions`) to
   route embeddings and query expansion/generation through an OpenAI-compatible

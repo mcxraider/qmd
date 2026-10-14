@@ -976,13 +976,8 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
-  /** Verify all three models can serve a request before an HTTP daemon reports ready. */
+  /** Warm the reranker before an HTTP daemon reports ready; embed/generate stay lazy. */
   async warmUp(): Promise<void> {
-    const embedding = await this.embed("QMD startup readiness check");
-    if (!embedding?.embedding.length) throw new Error("Embedding model warm-up failed");
-    const generation = await this.generate("QMD startup readiness check", { maxTokens: 1 });
-    if (!generation?.done) throw new Error("Query expansion model warm-up failed");
-    await this.expandQuery("QMD startup readiness check", { strict: true });
     const ranking = await this.rerank("readiness", [{ file: "warm-up", text: "QMD readiness check" }]);
     if (ranking.model === "fallback") throw new Error("Reranking model warm-up failed");
   }

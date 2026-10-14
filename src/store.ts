@@ -2122,6 +2122,13 @@ export type EmbedOptions = {
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
   /**
+   * Prepend an LLM-generated, document-level context to each chunk before
+   * embedding (Anthropic contextual retrieval). Only the embedded vector
+   * changes — stored body, pos, and displayed snippets are untouched. Adds one
+   * generate() call per chunk, so it is opt-in via `qmd embed --contextual`.
+   */
+  contextual?: boolean;
+  /**
    * Max wall-clock duration for the whole embed session, in milliseconds. When the
    * cap is reached, remaining document batches are skipped (re-run `qmd embed` to
    * continue). A value <= 0 disables the cap. Defaults to
@@ -2326,6 +2333,53 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   }));
 }
 
+/** Max per-document chunk-context generate() calls in flight at once. */
+const CONTEXTUAL_CONCURRENCY = 5;
+
+/** Map over items with at most `limit` promises in flight; preserves order. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Anthropic contextual-retrieval prompt: situate one chunk within its whole
+ * document. See https://platform.claude.com/cookbook/capabilities-contextual-embeddings-guide
+ */
+function chunkContextPrompt(docBody: string, chunkText: string): string {
+  return (
+    `<document>\n${docBody}\n</document>\n\n` +
+    `Here is the chunk we want to situate within the whole document\n\n` +
+    `<chunk>\n${chunkText}\n</chunk>\n\n` +
+    `Please give a short succinct context to situate this chunk within the overall ` +
+    `document for the purposes of improving search retrieval of the chunk. ` +
+    `Answer only with the succinct context and nothing else.`
+  );
+}
+
+/**
+ * Prepend an LLM-generated document-level context to a chunk before embedding.
+ * Best-effort: on any failure or empty generation, returns the raw chunk so
+ * enrichment never blocks embedding.
+ */
+async function contextualizeChunk(llm: LLM, docBody: string, chunkText: string): Promise<string> {
+  try {
+    const res = await llm.generate(chunkContextPrompt(docBody, chunkText), { maxTokens: 150 });
+    const context = res?.text?.trim();
+    return context ? `${context}\n\n${chunkText}` : chunkText;
+  } catch {
+    return chunkText;
+  }
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -2465,16 +2519,25 @@ export async function generateEmbeddings(
           session.signal,
         );
 
+        // When contextual enrichment is on, generate a document-level context
+        // for each chunk (bounded concurrency). The enriched text is what we
+        // embed; pos/tokens/bytes still describe the original chunk so snippet
+        // re-slicing from the stored body stays correct.
+        const texts = options?.contextual
+          ? await mapWithConcurrency(chunks, CONTEXTUAL_CONCURRENCY, (chunk) =>
+              contextualizeChunk(llm, doc.body, chunk.text))
+          : chunks.map((chunk) => chunk.text);
+
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
             hash: doc.hash,
             path: doc.path,
             title,
-            text: chunks[seq]!.text,
+            text: texts[seq]!,
             seq,
             pos: chunks[seq]!.pos,
             tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
+            bytes: encoder.encode(texts[seq]!).length,
             expectedTotalChunks: chunks.length,
           });
         }

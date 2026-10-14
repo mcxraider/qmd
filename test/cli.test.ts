@@ -3023,7 +3023,7 @@ describe("mcp http daemon", () => {
     ]);
     expect(exitCode).toBe(0);
     expect(stdout).toContain(`http://localhost:${port}/mcp`);
-    expect(stdout).toContain("all three models ready");
+    expect(stdout).toContain("reranker model ready");
 
     // PID file should exist
     expect(existsSync(pidPath())).toBe(true);

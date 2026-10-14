@@ -5627,6 +5627,64 @@ describe("Embedding batching", () => {
     }
   });
 
+  test("generateEmbeddings --contextual prepends generated context to each chunk's embedded text", async () => {
+    const store = await createTestStore();
+    const generateCalls: string[] = [];
+    const fakeLlm = {
+      ...createFakeEmbedLlm(),
+      async generate(prompt: string) {
+        generateCalls.push(prompt);
+        return { text: "CTX", model: "fake-gen", done: true };
+      },
+    };
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "contextual",
+        body: "# Contextual\n\nThe original chunk body about retrieval.",
+      });
+
+      const result = await generateEmbeddings(store, { contextual: true });
+
+      expect(result.chunksEmbedded).toBe(1);
+      // One generate() call per chunk, and the embedded text carries the
+      // context prefix followed by the original chunk text.
+      expect(generateCalls.length).toBe(1);
+      const embedded = fakeLlm.embedBatchCalls.flat();
+      expect(embedded.some((t) => t.includes("CTX\n\n") && t.includes("original chunk body"))).toBe(true);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
+  test("generateEmbeddings --contextual falls back to raw chunk when generate returns nothing", async () => {
+    const store = await createTestStore();
+    const fakeLlm = {
+      ...createFakeEmbedLlm(),
+      async generate() {
+        return null;
+      },
+    };
+    store.llm = fakeLlm as any;
+
+    try {
+      await insertTestDocument(store.db, "docs", {
+        name: "contextual-fallback",
+        body: "# Fallback\n\nUnsituated chunk text stays as-is.",
+      });
+
+      const result = await generateEmbeddings(store, { contextual: true });
+
+      expect(result.chunksEmbedded).toBe(1);
+      const embedded = fakeLlm.embedBatchCalls.flat();
+      expect(embedded.some((t) => t.includes("Unsituated chunk text stays as-is"))).toBe(true);
+      expect(embedded.some((t) => t.includes("CTX"))).toBe(false);
+    } finally {
+      await cleanupTestDb(store);
+    }
+  });
+
   test("legacy fingerprint adoption tokenizes with the store-local LLM", async () => {
     const store = await createTestStore();
     const fakeLlm = createFakeEmbedLlm();
