@@ -406,7 +406,7 @@ Intent-aware lex (C++ performance, not sports):
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
         candidateLimit: z.number().optional().describe(
-          "Maximum candidates to rerank (default: 40, lower = faster but may miss results)"
+          "Maximum candidates to rerank (default: 20, lower = faster but may miss results)"
         ),
         collections: z.array(z.string()).optional().describe("Filter to collections (OR match)"),
         filter: z.record(z.string(), z.unknown()).optional().describe(

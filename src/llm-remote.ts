@@ -4,8 +4,7 @@
  * Speaks the OpenAI-compatible REST surface exposed by gateways such as the
  * government PlatformAI gateway (verified shapes: `/v1/embeddings`,
  * `/v1/chat/completions`). Embeddings and query expansion / generation go over
- * the network; reranking is delegated to an on-device {@link LlamaCpp} because
- * the gateway offers no rerank endpoint.
+ * the network. The TypeSafe wrapper handles reranking in query paths.
  *
  * Uses native `fetch` — no vendor SDK dependency.
  */

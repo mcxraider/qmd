@@ -53,6 +53,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
+import { MissingTypeSafeKeyError } from "./llm-typesafe.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -479,8 +480,7 @@ export function chunkDocumentWithBreakPoints(
 export const STRONG_SIGNAL_MIN_SCORE = 0.85;
 export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
-// 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-export const RERANK_CANDIDATE_LIMIT = 40;
+export const RERANK_CANDIDATE_LIMIT = 20;
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -6556,7 +6556,11 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6573,7 +6577,7 @@ export async function hybridQuery(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6593,7 +6597,7 @@ export async function hybridQuery(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 
@@ -6951,7 +6955,11 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6967,7 +6975,7 @@ export async function structuredSearch(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6987,7 +6995,7 @@ export async function structuredSearch(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 

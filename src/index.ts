@@ -71,6 +71,7 @@ import {
   type LLM,
 } from "./llm.js";
 import { RemoteLLM } from "./llm-remote.js";
+import { TypeSafeLLM } from "./llm-typesafe.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -236,7 +237,7 @@ export interface SearchOptions {
   filter?: MetadataFilter;
   /** Max results (default: 10) */
   limit?: number;
-  /** Max candidates to rerank (default: 40) */
+  /** Max candidates to rerank (default: 20) */
   candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
@@ -501,7 +502,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       localForRerank: localLlm,
     });
   }
-  internal.llm = llm;
+  internal.llm = new TypeSafeLLM(llm);
 
   const store: QMDStore = {
     internal,

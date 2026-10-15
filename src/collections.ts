@@ -38,12 +38,13 @@ export interface Collection {
  */
 export interface ModelsConfig {
   embed?: string;
+  /** Legacy local reranker URI; ignored while TypeSafe Jev handles reranking. */
   rerank?: string;
   generate?: string;
   /**
    * Route embeddings and query-expansion/generation through a remote
-   * OpenAI-compatible API instead of on-device models. Reranking stays local
-   * (uses `rerank` above). The API key is read from the QMD_API_KEY env var,
+   * OpenAI-compatible API instead of on-device models. Reranking uses TypeSafe Jev.
+   * The provider API key is read from the QMD_API_KEY env var,
    * never from this file.
    */
   provider?: {
