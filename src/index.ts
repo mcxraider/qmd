@@ -68,7 +68,10 @@ import {
 } from "./store.js";
 import {
   LlamaCpp,
+  type LLM,
 } from "./llm.js";
+import { RemoteLLM } from "./llm-remote.js";
+import { TypeSafeLLM } from "./llm-typesafe.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -234,7 +237,7 @@ export interface SearchOptions {
   filter?: MetadataFilter;
   /** Max results (default: 10) */
   limit?: number;
-  /** Max candidates to rerank (default: 40) */
+  /** Max candidates to rerank (default: 20) */
   candidateLimit?: number;
   /** Minimum score threshold */
   minScore?: number;
@@ -472,16 +475,33 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   }
   // else: DB-only mode — no external config, use existing store_collections
 
-  // Create a per-store LlamaCpp instance — lazy-loads models on first use,
-  // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  // Keep a local backend for reranking and tokenization even when embeddings
+  // and query expansion use a remote provider.
+  const localLlm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: options.keepModelsWarm ? 0 : 5 * 60 * 1000,
     disposeModelsOnInactivity: !options.keepModelsWarm,
   });
-  internal.llm = llm;
+  let llm: LLM = localLlm;
+  const provider = config?.models?.provider;
+  if (provider?.base_url) {
+    const apiKey = process.env.QMD_API_KEY;
+    if (!apiKey) {
+      internal.close();
+      if (hasYamlConfig || options.config) setConfigSource(undefined);
+      throw new Error("models.provider is configured but QMD_API_KEY is not set");
+    }
+    llm = new RemoteLLM({
+      baseURL: provider.base_url,
+      apiKey,
+      embedModel: provider.embed ?? "cohere.embed-v4:0",
+      generateModel: provider.generate ?? "bedrock.claude-sonnet-5-5",
+      dimensions: provider.embed_dimensions ?? 1536,
+      localTokenizer: localLlm,
+    });
+  }
+  internal.llm = new TypeSafeLLM(llm);
 
   const store: QMDStore = {
     internal,

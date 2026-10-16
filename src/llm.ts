@@ -91,6 +91,16 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
   return /qwen.*embed/i.test(modelUri) || /embed.*qwen/i.test(modelUri);
 }
 
+// Embed-model names that take raw text (no in-text task prefix) because the
+// backend conveys task intent out-of-band — e.g. a remote API using an
+// `input_type` request field. Registered by RemoteLLM on construction.
+const rawTextEmbedModels = new Set<string>();
+
+/** Register an embed-model name whose inputs must not be prompt-prefixed. */
+export function registerRemoteEmbedModel(model: string): void {
+  rawTextEmbedModels.add(model);
+}
+
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
@@ -98,6 +108,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (rawTextEmbedModels.has(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -111,6 +122,7 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (rawTextEmbedModels.has(uri)) return text;
   if (isQwen3EmbeddingModel(uri)) {
     // Qwen3-Embedding: documents are raw text, no task prefix
     return title ? `${title}\n${text}` : text;
@@ -272,6 +284,48 @@ export type RerankDocument = {
   title?: string;
 };
 
+/**
+ * Parse query-expansion model output into Queryable sub-queries.
+ *
+ * Expects lines of the form `lex: ...` / `vec: ...` / `hyde: ...`. Lines whose
+ * expanded text shares no token with the original query are dropped (degenerate
+ * terms that match nothing). Shared by the local (GBNF-constrained) and remote
+ * (chat-prompted) backends so both honour the same contract.
+ */
+export function parseExpansionLines(raw: string, query: string, includeLexical: boolean): Queryable[] {
+  const lines = raw.trim().split("\n");
+  const queryTerms = query.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
+  const hasQueryTerm = (text: string): boolean => {
+    if (queryTerms.length === 0) return true;
+    const lower = text.toLowerCase();
+    return queryTerms.some(term => lower.includes(term));
+  };
+
+  const queryables: Queryable[] = lines.map(line => {
+    const colonIdx = line.indexOf(":");
+    if (colonIdx === -1) return null;
+    const type = line.slice(0, colonIdx).trim();
+    if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
+    const text = line.slice(colonIdx + 1).trim();
+    if (!text || !hasQueryTerm(text)) return null;
+    return { type: type as QueryType, text };
+  }).filter((q): q is Queryable => q !== null);
+
+  return includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+}
+
+/**
+ * Default fallback sub-queries when expansion yields nothing usable.
+ */
+export function expansionFallback(query: string, includeLexical: boolean): Queryable[] {
+  const fallback: Queryable[] = [
+    { type: 'hyde', text: `Information about ${query}` },
+    { type: 'lex', text: query },
+    { type: 'vec', text: query },
+  ];
+  return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+}
+
 // =============================================================================
 // Model Configuration
 // =============================================================================
@@ -281,6 +335,10 @@ export type RerankDocument = {
 // Override via QMD_EMBED_MODEL env var (e.g. hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf)
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
 const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
+// Fallback used when a custom reranker fails to load or its ranking context
+// can't be created (e.g. a ModernBERT/Ettin GGUF: the bundled llama.cpp has no
+// ranking head for that arch). Defaults to the standard Qwen3 reranker.
+const RERANK_FALLBACK_MODEL = DEFAULT_RERANK_MODEL;
 // const DEFAULT_GENERATE_MODEL = "hf:ggml-org/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 
@@ -594,6 +652,11 @@ export interface LLM {
   embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null>;
 
   /**
+   * Batch embed multiple texts (order-preserving; nulls for failures)
+   */
+  embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]>;
+
+  /**
    * Generate text completion
    */
   generate(prompt: string, options?: GenerateOptions): Promise<GenerateResult | null>;
@@ -619,6 +682,18 @@ export interface LLM {
    * Dispose of resources
    */
   dispose(): Promise<void>;
+
+  /** Resolved model names (used for cache keys and fingerprints). */
+  readonly embedModelName: string;
+  readonly generateModelName: string;
+  readonly rerankModelName: string;
+
+  /** Tokenize/detokenize for token-boundary chunking. */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
+
+  /** Verify the backend can serve a request before a daemon reports ready. */
+  warmUp(): Promise<void>;
 }
 
 // =============================================================================
@@ -629,6 +704,11 @@ export type LlamaCppConfig = {
   embedModel?: string;
   generateModel?: string;
   rerankModel?: string;
+  /**
+   * Reranker to fall back to if `rerankModel` fails to load its ranking
+   * context (default: Qwen3-Reranker-0.6B). Set to "" to disable the fallback.
+   */
+  rerankFallbackModel?: string;
   modelCacheDir?: string;
   /**
    * Context size used for query expansion generation contexts.
@@ -841,6 +921,8 @@ export class LlamaCpp implements LLM {
   private embedModelUri: string;
   private generateModelUri: string;
   private rerankModelUri: string;
+  /** Reranker to try if `rerankModelUri` won't load; "" disables fallback. */
+  private rerankFallbackUri: string;
   private modelCacheDir: string;
   private expandContextSize: number;
 
@@ -875,6 +957,7 @@ export class LlamaCpp implements LLM {
     this.embedModelUri = resolveEmbedModel({ embed: config.embedModel });
     this.generateModelUri = resolveGenerateModel({ generate: config.generateModel });
     this.rerankModelUri = resolveRerankModel({ rerank: config.rerankModel });
+    this.rerankFallbackUri = config.rerankFallbackModel ?? RERANK_FALLBACK_MODEL;
     this.modelCacheDir = config.modelCacheDir || MODEL_CACHE_DIR;
     this.expandContextSize = resolveExpandContextSize(config.expandContextSize);
     this.inactivityTimeoutMs = config.inactivityTimeoutMs ?? DEFAULT_INACTIVITY_TIMEOUT_MS;
@@ -893,15 +976,9 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
-  /** Verify all three models can serve a request before an HTTP daemon reports ready. */
+  /** API reranker readiness is checked by TypeSafeLLM. */
   async warmUp(): Promise<void> {
-    const embedding = await this.embed("QMD startup readiness check");
-    if (!embedding?.embedding.length) throw new Error("Embedding model warm-up failed");
-    const generation = await this.generate("QMD startup readiness check", { maxTokens: 1 });
-    if (!generation?.done) throw new Error("Query expansion model warm-up failed");
-    await this.expandQuery("QMD startup readiness check", { strict: true });
-    const ranking = await this.rerank("readiness", [{ file: "warm-up", text: "QMD readiness check" }]);
-    if (ranking.model === "fallback") throw new Error("Reranking model warm-up failed");
+    // Local model loading remains lazy.
   }
 
   /**
@@ -1320,8 +1397,16 @@ export class LlamaCpp implements LLM {
 
     this.rerankModelLoadPromise = (async () => {
       const llama = await this.ensureLlama();
-      const modelPath = await this.resolveModel(this.rerankModelUri);
-      const model = await llama.loadModel(this.modelLoadOptions(modelPath));
+      let model: LlamaModel;
+      try {
+        model = await llama.loadModel(this.modelLoadOptions(await this.resolveModel(this.rerankModelUri)));
+      } catch (error) {
+        if (!this.rerankFallbackUri || this.rerankFallbackUri === this.rerankModelUri) throw error;
+        const detail = error instanceof Error ? error.message : String(error);
+        console.warn(`Reranker ${this.rerankModelUri} failed to load (${detail}) — falling back to ${this.rerankFallbackUri}`);
+        this.rerankModelUri = this.rerankFallbackUri;
+        model = await llama.loadModel(this.modelLoadOptions(await this.resolveModel(this.rerankModelUri)));
+      }
       this.rerankModel = model;
       // Model loading counts as activity - ping to keep alive
       this.touchActivity();
@@ -1384,11 +1469,23 @@ export class LlamaCpp implements LLM {
           }));
         } catch (error) {
           if (this.rerankContexts.length === 0) {
+            const detail = error instanceof Error ? error.message : String(error);
+            // The model loaded but its ranking context won't create — the
+            // likely ModernBERT failure mode. Try the fallback reranker once
+            // before giving up (e.g. Ettin → Qwen3).
+            if (this.rerankFallbackUri && this.rerankFallbackUri !== this.rerankModelUri) {
+              console.warn(`Reranker ${this.rerankModelUri} ranking context failed (${detail}) — falling back to ${this.rerankFallbackUri}`);
+              this.rerankModelUri = this.rerankFallbackUri;
+              const old = this.rerankModel;
+              this.rerankModel = null;
+              if (old) await old.dispose().catch(() => {});
+              this.rerankContextsCreatePromise = null;
+              return await this.ensureRerankContexts();
+            }
             // Surface the underlying failure (e.g. out of VRAM). A previous
             // "retry without flash attention" path was dead: ranking contexts
             // never accepted that option, so the retry repeated identical
             // arguments and the real error was discarded.
-            const detail = error instanceof Error ? error.message : String(error);
             console.warn(
               `Reranker unavailable — skipping reranking (${detail}). ` +
               "Use --no-rerank to silence this warning.",
@@ -1694,37 +1791,10 @@ export class LlamaCpp implements LLM {
         },
       });
 
-      const lines = result.trim().split("\n");
-      const queryLower = query.toLowerCase();
-      const queryTerms = queryLower.replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter(Boolean);
-
-      const hasQueryTerm = (text: string): boolean => {
-        const lower = text.toLowerCase();
-        if (queryTerms.length === 0) return true;
-        return queryTerms.some(term => lower.includes(term));
-      };
-
-      const queryables: Queryable[] = lines.map(line => {
-        const colonIdx = line.indexOf(":");
-        if (colonIdx === -1) return null;
-        const type = line.slice(0, colonIdx).trim();
-        if (type !== 'lex' && type !== 'vec' && type !== 'hyde') return null;
-        const text = line.slice(colonIdx + 1).trim();
-        if (!hasQueryTerm(text)) return null;
-        return { type: type as QueryType, text };
-      }).filter((q): q is Queryable => q !== null);
-
-      // Filter out lex entries if not requested
-      const filtered = includeLexical ? queryables : queryables.filter(q => q.type !== 'lex');
+      const filtered = parseExpansionLines(result, query, includeLexical);
       if (filtered.length > 0) return filtered;
       if (options.strict) throw new Error("Query expansion model produced no usable queries");
-
-      const fallback: Queryable[] = [
-        { type: 'hyde', text: `Information about ${query}` },
-        { type: 'lex', text: query },
-        { type: 'vec', text: query },
-      ];
-      return includeLexical ? fallback : fallback.filter(q => q.type !== 'lex');
+      return expansionFallback(query, includeLexical);
     } catch (error) {
       if (options.strict) throw error;
       console.error("Structured query expansion failed:", error);
@@ -1939,11 +2009,11 @@ export class LlamaCpp implements LLM {
  * Coordinates with LlamaCpp idle timeout to prevent disposal during active sessions.
  */
 class LLMSessionManager {
-  private llm: LlamaCpp;
+  private llm: LLM;
   private _activeSessionCount = 0;
   private _inFlightOperations = 0;
 
-  constructor(llm: LlamaCpp) {
+  constructor(llm: LLM) {
     this.llm = llm;
   }
 
@@ -1979,7 +2049,7 @@ class LLMSessionManager {
     this._inFlightOperations = Math.max(0, this._inFlightOperations - 1);
   }
 
-  getLlamaCpp(): LlamaCpp {
+  getLlamaCpp(): LLM {
     return this.llm;
   }
 }
@@ -2152,7 +2222,7 @@ export async function withLLMSession<T>(
  * Unlike withLLMSession, this does not use the global singleton.
  */
 export async function withLLMSessionForLlm<T>(
-  llm: LlamaCpp,
+  llm: LLM,
   fn: (session: ILLMSession) => Promise<T>,
   options?: LLMSessionOptions
 ): Promise<T> {

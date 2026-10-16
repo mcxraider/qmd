@@ -38,8 +38,21 @@ export interface Collection {
  */
 export interface ModelsConfig {
   embed?: string;
+  /** Legacy local reranker URI; ignored while TypeSafe Jev handles reranking. */
   rerank?: string;
   generate?: string;
+  /**
+   * Route embeddings and query-expansion/generation through a remote
+   * OpenAI-compatible API instead of on-device models. Reranking uses TypeSafe Jev.
+   * The provider API key is read from the QMD_API_KEY env var,
+   * never from this file.
+   */
+  provider?: {
+    base_url: string;            // e.g. https://api.ai.tech.gov.sg/platform/models
+    embed?: string;              // remote embedding model (default: "cohere.embed-v4:0")
+    generate?: string;           // remote chat model (default: "bedrock.claude-sonnet-5-5")
+    embed_dimensions?: number;   // output_dimension for the embeddings request (default: 1536)
+  };
 }
 
 /**

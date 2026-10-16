@@ -152,6 +152,13 @@ reusable contexts loaded while running, so startup takes longer and uses more
 memory. If warm-up fails, startup exits nonzero; inspect `~/.cache/qmd/mcp.log`
 for the error. Foreground HTTP and stdio MCP servers retain lazy model loading.
 
+Reranked queries use TypeSafe Jev (`jev-1.13.0`). Set `TYPESAFE_API_KEY` in the
+process environment before starting QMD; `--no-rerank` and `rerank: false` do
+not need it. QMD sends each selected passage and query to TypeSafe. If the
+service fails during a query, QMD returns the retrieval-ranked results. An
+existing `models.rerank` GGUF setting is ignored; `qmd pull` no longer downloads
+a local reranker.
+
 The server binds to `localhost` by default. Pass `--host` (or set the `QMD_HOST`
 environment variable) to override — `--host 0.0.0.0` is useful when the server
 runs in a container and a liveness probe connects from a non-loopback address.
@@ -199,7 +206,7 @@ Point any MCP client at `http://localhost:8181/mcp` to connect.
 | `query` | `intent` | string | Disambiguation context (does not search on its own) |
 | `query` | `limit` | number | Max results (default 10) |
 | `query` | `minScore` | number | Minimum relevance 0–1 (default 0) |
-| `query` | `candidateLimit` | number | Max candidates to rerank (default 40) |
+| `query` | `candidateLimit` | number | Max candidates to rerank (default 20) |
 | `query` | `rerank` | boolean | Run LLM reranking (default **true**); set false for RRF-only |
 | `get` | `file` | string | Path, docid (`#abc123`), or `path:from:count` (e.g. `#abc123:120:40`) |
 | `get` | `fromLine` | number | Start line (1-indexed); overrides the `:from` suffix |
@@ -517,13 +524,13 @@ The SDK requires explicit `dbPath` — no defaults are assumed. This makes it sa
                           │   RRF Fusion + Bonus  │
                           │  Original query: ×2   │
                           │  Top-rank bonus: +0.05│
-                          │     Top 30 Kept       │
+                          │     Top 20 Kept       │
                           └───────────┬───────────┘
                                       │
                                       ▼
                           ┌───────────────────────┐
-                          │    LLM Re-ranking     │
-                          │  (qwen3-reranker)     │
+                          │    Jev Re-ranking     │
+                          │  (TypeSafe API)       │
                           │  Yes/No + logprobs    │
                           └───────────┬───────────┘
                                       │
@@ -585,12 +592,12 @@ The `query` command uses **Reciprocal Rank Fusion (RRF)** with position-aware bl
 
 ### GGUF Models (via node-llama-cpp)
 
-QMD uses three local GGUF models (auto-downloaded on first use):
+QMD uses two local GGUF models (auto-downloaded on first use) and TypeSafe Jev for reranking:
 
 | Model | Purpose | Size |
 |-------|---------|------|
 | `embeddinggemma-300M-Q8_0` | Vector embeddings (default) | ~300MB |
-| `qwen3-reranker-0.6b-q8_0` | Re-ranking | ~640MB |
+| `jev-1.13.0` | Re-ranking via TypeSafe API | No local download |
 | `qmd-query-expansion-1.7B-q4_k_m` | Query expansion (fine-tuned) | ~1.1GB |
 
 Models are downloaded from HuggingFace and cached in `~/.cache/qmd/models/`.
@@ -764,7 +771,7 @@ editor_uri: "vscode://file{path}:{line}:{col}"
 # resolved defaults. See "Model Configuration" for the default URIs.
 models:
   embed: "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf"
-  rerank: "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf"
+  # Reranking uses TypeSafe Jev and TYPESAFE_API_KEY.
   generate: "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf"
 
 # One entry per collection. The key is the collection name.
@@ -786,7 +793,7 @@ collections:
 |-----|-------|---------|
 | `global_context` | top-level | Context prepended for every collection. Set via `qmd context add /`. |
 | `editor_uri` (alias `editor_uri_template`) | top-level | Hyperlink template for clickable result paths; `QMD_EDITOR_URI` overrides. |
-| `models.embed` / `.rerank` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
+| `models.embed` / `.generate` | top-level | HuggingFace GGUF URIs (`hf:<user>/<repo>/<file>`) overriding the built-in defaults per role. |
 | `collections.<name>.path` | per-collection | Absolute directory to index. |
 | `collections.<name>.pattern` | per-collection | Glob mask. Set via `qmd collection add --mask`. Default `**/*.md`. Comma-separated lists and brace groups (`{a,b}`) are a union of patterns. |
 | `collections.<name>.ignore` | per-collection | Glob patterns excluded from indexing — useful to stop nested collections double-indexing. **YAML-only — no CLI command sets this.** Additive with QMD's built-in exclusions (`node_modules`, `.git`, `.cache`, `vendor`, `dist`, `build`), which you cannot un-ignore. |
@@ -901,7 +908,7 @@ and `deep-search` (→ `query`).
 --index <name>     # Use named index
 --intent "<text>"  # Disambiguation context (e.g. "web page load times")
 --no-rerank        # Skip LLM reranking (RRF scores only; faster on CPU)
--C, --candidate-limit <n>  # Max candidates to rerank (default: 40)
+-C, --candidate-limit <n>  # Max candidates to rerank (default: 20)
 --full-path        # Emit on-disk filesystem paths instead of qmd:// URIs
                    # (a result whose file has moved or been deleted since
                    #  indexing keeps its qmd:// URI + docid, and a notice is
@@ -1439,6 +1446,7 @@ llm_cache              -- Cached LLM responses (query expansion, rerank scores)
 | `XDG_CACHE_HOME` | `~/.cache` | Cache directory location |
 | `XDG_CONFIG_HOME` | `~/.config` | Config directory location (where `index.yml` lives) |
 | `QMD_CONFIG_DIR` | unset | Override the config directory outright (takes precedence over `XDG_CONFIG_HOME`) |
+| `TYPESAFE_API_KEY` | unset | Required for Jev reranking; load it into the QMD process environment. |
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
@@ -1540,11 +1548,11 @@ Query ──► LLM Expansion ──► [Original, Variant 1, Variant 2]
          Top-rank bonus: +0.05/#1, +0.02/#2-3
                 │
                 ▼
-         Top 30 candidates
+         Top 20 candidates
                 │
                 ▼
-         LLM Re-ranking
-         (yes/no + logprob confidence)
+         Jev Re-ranking
+         (query–passage relevance probability)
                 │
                 ▼
          Position-Aware Blend
@@ -1562,7 +1570,6 @@ The default models are defined in `src/llm.ts` as HuggingFace URIs:
 
 ```typescript
 const DEFAULT_EMBED_MODEL = "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf";
-const DEFAULT_RERANK_MODEL = "hf:ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/qwen3-reranker-0.6b-q8_0.gguf";
 const DEFAULT_GENERATE_MODEL = "hf:tobil/qmd-query-expansion-1.7B-gguf/qmd-query-expansion-1.7B-q4_k_m.gguf";
 ```
 
@@ -1580,9 +1587,9 @@ Override them per-role without touching source via the `models:` block in
 "title: {title} | text: {content}"
 ```
 
-### Qwen3-Reranker
+### TypeSafe Jev reranker
 
-Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross-encoder reranking. Returns documents sorted by relevance score (0.0 - 1.0).
+Sends each selected query–passage pair to TypeSafe and uses its Noul relevance probability as the rerank score. Set `TYPESAFE_API_KEY` for reranked queries.
 
 ### Qwen3 (Query Expansion)
 

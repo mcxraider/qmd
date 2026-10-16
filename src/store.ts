@@ -53,6 +53,7 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 // Note: node:path resolve is not imported — we export our own cross-platform resolve()
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
+import { MissingTypeSafeKeyError } from "./llm-typesafe.js";
 import {
   LlamaCpp,
   getDefaultLlamaCpp,
@@ -62,6 +63,7 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -187,7 +189,7 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
  * Get the LlamaCpp instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
+function getLlm(store: Store): LLM {
   return store.llm ?? getDefaultLlamaCpp();
 }
 
@@ -478,8 +480,7 @@ export function chunkDocumentWithBreakPoints(
 export const STRONG_SIGNAL_MIN_SCORE = 0.85;
 export const STRONG_SIGNAL_MIN_GAP = 0.15;
 // Max candidates to pass to reranker — balances quality vs latency.
-// 40 keeps rank 31-40 visible to the reranker (matters for recall on broad queries).
-export const RERANK_CANDIDATE_LIMIT = 40;
+export const RERANK_CANDIDATE_LIMIT = 20;
 
 /**
  * A typed query expansion result. Decoupled from llm.ts internal Queryable —
@@ -1585,8 +1586,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM backend for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -2121,6 +2122,13 @@ export type EmbedOptions = {
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
   /**
+   * Prepend an LLM-generated, document-level context to each chunk before
+   * embedding (Anthropic contextual retrieval). Only the embedded vector
+   * changes — stored body, pos, and displayed snippets are untouched. Adds one
+   * generate() call per chunk, so it is opt-in via `qmd embed --contextual`.
+   */
+  contextual?: boolean;
+  /**
    * Max wall-clock duration for the whole embed session, in milliseconds. When the
    * cap is reached, remaining document batches are skipped (re-run `qmd embed` to
    * continue). A value <= 0 disables the cap. Defaults to
@@ -2325,6 +2333,53 @@ function getEmbeddingDocsForBatch(db: Database, batch: PendingEmbeddingDoc[]): E
   }));
 }
 
+/** Max per-document chunk-context generate() calls in flight at once. */
+const CONTEXTUAL_CONCURRENCY = 5;
+
+/** Map over items with at most `limit` promises in flight; preserves order. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/**
+ * Anthropic contextual-retrieval prompt: situate one chunk within its whole
+ * document. See https://platform.claude.com/cookbook/capabilities-contextual-embeddings-guide
+ */
+function chunkContextPrompt(docBody: string, chunkText: string): string {
+  return (
+    `<document>\n${docBody}\n</document>\n\n` +
+    `Here is the chunk we want to situate within the whole document\n\n` +
+    `<chunk>\n${chunkText}\n</chunk>\n\n` +
+    `Please give a short succinct context to situate this chunk within the overall ` +
+    `document for the purposes of improving search retrieval of the chunk. ` +
+    `Answer only with the succinct context and nothing else.`
+  );
+}
+
+/**
+ * Prepend an LLM-generated document-level context to a chunk before embedding.
+ * Best-effort: on any failure or empty generation, returns the raw chunk so
+ * enrichment never blocks embedding.
+ */
+async function contextualizeChunk(llm: LLM, docBody: string, chunkText: string): Promise<string> {
+  try {
+    const res = await llm.generate(chunkContextPrompt(docBody, chunkText), { maxTokens: 150 });
+    const context = res?.text?.trim();
+    return context ? `${context}\n\n${chunkText}` : chunkText;
+  } catch {
+    return chunkText;
+  }
+}
+
 /**
  * Generate vector embeddings for documents that need them.
  * Pure function — no console output, no db lifecycle management.
@@ -2464,16 +2519,25 @@ export async function generateEmbeddings(
           session.signal,
         );
 
+        // When contextual enrichment is on, generate a document-level context
+        // for each chunk (bounded concurrency). The enriched text is what we
+        // embed; pos/tokens/bytes still describe the original chunk so snippet
+        // re-slicing from the stored body stays correct.
+        const texts = options?.contextual
+          ? await mapWithConcurrency(chunks, CONTEXTUAL_CONCURRENCY, (chunk) =>
+              contextualizeChunk(llm, doc.body, chunk.text))
+          : chunks.map((chunk) => chunk.text);
+
         for (let seq = 0; seq < chunks.length; seq++) {
           batchChunks.push({
             hash: doc.hash,
             path: doc.path,
             title,
-            text: chunks[seq]!.text,
+            text: texts[seq]!,
             seq,
             pos: chunks[seq]!.pos,
             tokens: chunks[seq]!.tokens,
-            bytes: encoder.encode(chunks[seq]!.text).length,
+            bytes: encoder.encode(texts[seq]!).length,
             expectedTotalChunks: chunks.length,
           });
         }
@@ -3838,7 +3902,7 @@ function stripUnpairedSurrogates(text: string): string {
  * for supported code files.
  */
 async function chunkDocumentByTokensWithLlm(
-  llm: LlamaCpp,
+  llm: LLM,
   content: string,
   maxTokens: number = CHUNK_SIZE_TOKENS,
   overlapTokens: number = CHUNK_OVERLAP_TOKENS,
@@ -4973,7 +5037,7 @@ function nearestVecDocuments(
   }
 }
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LLM, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
@@ -5044,7 +5108,7 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
@@ -5261,7 +5325,7 @@ function uniqueExpansions(expansions: ExpandedQuery[]): ExpandedQuery[] {
   });
 }
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types. Intent is
   // deliberately absent from both the cache key and the generation call:
   // feeding caller intent to the expansion model contaminates sub-queries
@@ -5316,7 +5380,7 @@ export function deleteExpansionCacheEntry(db: Database, query: string, model: st
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
   const llm = llmOverride ?? getDefaultLlamaCpp();
@@ -6354,7 +6418,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -6492,7 +6556,11 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(query, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -6509,7 +6577,7 @@ export async function hybridQuery(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6529,7 +6597,7 @@ export async function hybridQuery(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 
@@ -6756,7 +6824,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {
@@ -6887,7 +6955,11 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent).catch(error => {
+    if (error instanceof MissingTypeSafeKeyError) throw error;
+    console.warn("TypeSafe reranking unavailable; using retrieval ranking:", error instanceof Error ? error.message : String(error));
+    return chunksToRerank.map(doc => ({ file: doc.file, score: NaN }));
+  });
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
@@ -6903,7 +6975,7 @@ export async function structuredSearch(
     else if (rrfRank <= 10) rrfWeight = 0.60;
     else rrfWeight = 0.40;
     const rrfScore = 1 / rrfRank;
-    const blendedScore = rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
+    const blendedScore = Number.isNaN(r.score) ? rrfScore : rrfWeight * rrfScore + (1 - rrfWeight) * r.score;
 
     const candidate = candidateMap.get(r.file);
     const chunkInfo = docChunkMap.get(r.file);
@@ -6923,7 +6995,7 @@ export async function structuredSearch(
         totalScore: trace?.totalScore ?? 0,
         contributions: trace?.contributions ?? [],
       },
-      rerankScore: r.score,
+      rerankScore: Number.isNaN(r.score) ? 0 : r.score,
       blendedScore,
     } : undefined;
 

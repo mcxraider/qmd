@@ -23,6 +23,7 @@ qmd doctor                        # Diagnose config, index, model, and device is
 qmd update                        # Re-index collections; configured update hooks run first
 qmd trust [list|revoke]           # Approve a checked-in .qmd config's hooks/paths/models
 qmd embed                         # Generate vector embeddings (uses node-llama-cpp)
+qmd embed --contextual            # Prepend LLM-generated document context to each chunk before embedding (Anthropic contextual retrieval)
 qmd query <query>                 # Search with query expansion + reranking (recommended)
 qmd search <query>                # Full-text keyword search (BM25, no LLM)
 qmd vsearch <query>               # Vector similarity search (no reranking)
