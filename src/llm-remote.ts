@@ -23,6 +23,7 @@ import type {
   LlamaCpp,
 } from "./llm.js";
 import { parseExpansionLines, expansionFallback, registerRemoteEmbedModel } from "./llm.js";
+import { TYPESAFE_RERANK_MODEL } from "./llm-typesafe.js";
 import type { Token as LlamaToken } from "node-llama-cpp";
 
 // Cohere embed-v4 accepts up to 96 inputs per request (mirrors the reference impl).
@@ -38,8 +39,8 @@ export type RemoteLLMConfig = {
   generateModel: string;
   /** output_dimension sent to the embeddings endpoint (e.g. 1536 for cohere.embed-v4:0) */
   dimensions?: number;
-  /** On-device backend used for reranking (and tokenizer-based chunking upstream). */
-  localForRerank: LlamaCpp;
+  /** On-device tokenizer used for chunking. */
+  localTokenizer: LlamaCpp;
   timeoutMs?: number;
 };
 
@@ -51,7 +52,7 @@ export class RemoteLLM implements LLM {
   private embedModel: string;
   private generateModel: string;
   private dimensions?: number;
-  private local: LlamaCpp;
+  private localTokenizer: LlamaCpp;
   private timeoutMs: number;
 
   constructor(config: RemoteLLMConfig) {
@@ -60,7 +61,7 @@ export class RemoteLLM implements LLM {
     this.embedModel = config.embedModel;
     this.generateModel = config.generateModel;
     this.dimensions = config.dimensions;
-    this.local = config.localForRerank;
+    this.localTokenizer = config.localTokenizer;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     // Tell the embedding formatters to leave text untouched for this model:
     // the API uses the `input_type` request field, not an in-text task prefix.
@@ -184,8 +185,7 @@ export class RemoteLLM implements LLM {
   }
 
   async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
-    // No rerank endpoint on the gateway — use the on-device reranker.
-    return this.local.rerank(query, documents, options);
+    throw new Error("RemoteLLM has no rerank endpoint; use TypeSafeLLM");
   }
 
   async modelExists(model: string): Promise<ModelInfo> {
@@ -193,7 +193,7 @@ export class RemoteLLM implements LLM {
   }
 
   async dispose(): Promise<void> {
-    await this.local.dispose();
+    await this.localTokenizer.dispose();
   }
 
   get embedModelName(): string {
@@ -205,24 +205,20 @@ export class RemoteLLM implements LLM {
   }
 
   get rerankModelName(): string {
-    return this.local.rerankModelName;
+    return TYPESAFE_RERANK_MODEL;
   }
 
   // Token-boundary chunking uses the local tokenizer; it does not need to match
   // the remote embedding tokenizer (chunk sizes are approximate budgets).
   tokenize(text: string): Promise<readonly LlamaToken[]> {
-    return this.local.tokenize(text);
+    return this.localTokenizer.tokenize(text);
   }
 
   detokenize(tokens: readonly LlamaToken[]): Promise<string> {
-    return this.local.detokenize(tokens);
+    return this.localTokenizer.detokenize(tokens);
   }
 
   async warmUp(): Promise<void> {
-    // Only the local reranker loads a model into memory; embed/generate are
-    // remote API calls with nothing to warm (and we avoid a paid call on every
-    // daemon startup).
-    const ranking = await this.rerank("readiness", [{ file: "warm-up", text: "QMD readiness check" }]);
-    if (ranking.model === "fallback") throw new Error("Reranking model warm-up failed");
+    // The TypeSafe wrapper owns API readiness checks.
   }
 }

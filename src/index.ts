@@ -480,7 +480,6 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
   const localLlm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
-    rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: options.keepModelsWarm ? 0 : 5 * 60 * 1000,
     disposeModelsOnInactivity: !options.keepModelsWarm,
   });
@@ -499,7 +498,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       embedModel: provider.embed ?? "cohere.embed-v4:0",
       generateModel: provider.generate ?? "bedrock.claude-sonnet-5-5",
       dimensions: provider.embed_dimensions ?? 1536,
-      localForRerank: localLlm,
+      localTokenizer: localLlm,
     });
   }
   internal.llm = new TypeSafeLLM(llm);

@@ -1430,6 +1430,7 @@ describe("Query expansion cache (#818)", () => {
       await hybridQuery(store, "musubi", { limit: 5, minScore: 0, skipRerank: true, intent: "x" });
 
       expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy).toHaveBeenCalledWith(expect.any(Array), { isQuery: true });
       expect(embedBatchSpy.mock.calls[0]![0]).toHaveLength(3);
     } finally {
       await cleanupTestDb(store);
@@ -6248,6 +6249,7 @@ describe("Embedding batching", () => {
       await hybridQuery(store, "hybrid query", { limit: 5, minScore: 0, skipRerank: true });
 
       expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy).toHaveBeenCalledWith(expect.any(Array), { isQuery: true });
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("hybrid query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);
@@ -6321,6 +6323,7 @@ describe("Embedding batching", () => {
       });
 
       expect(embedBatchSpy).toHaveBeenCalledTimes(1);
+      expect(embedBatchSpy).toHaveBeenCalledWith(expect.any(Array), { isQuery: true });
       expect(searchVecSpy).toHaveBeenCalledTimes(1);
       expect(searchVecSpy.mock.calls[0]?.[0]).toBe("structured query");
       expect(searchVecSpy.mock.calls[0]?.[1]).toBe(model);

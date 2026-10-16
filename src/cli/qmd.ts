@@ -186,7 +186,6 @@ function getStore(): ReturnType<typeof createStore> {
       const localLlm = new LlamaCpp({
         embedModel: modelsForLlm.embed,
         generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
       });
       // The local instance stays the global default: it provides the tokenizer
       // (chunking) and device probing (doctor) regardless of backend.
@@ -206,7 +205,7 @@ function getStore(): ReturnType<typeof createStore> {
           embedModel: provider.embed ?? "cohere.embed-v4:0",
           generateModel: provider.generate ?? "bedrock.claude-sonnet-5-5",
           dimensions: provider.embed_dimensions ?? 1536,
-          localForRerank: localLlm,
+          localTokenizer: localLlm,
         }));
       } else {
         store.llm = new TypeSafeLLM(localLlm);
@@ -792,6 +791,7 @@ function collectSensitiveSnapshot(): SensitiveSnapshot {
       rerank: config.models?.rerank,
       generate: config.models?.generate,
     },
+    provider: config.models?.provider,
   };
 }
 
@@ -851,6 +851,11 @@ function printGatedItems(gated: GatedItems): void {
     for (const item of gated.models) {
       console.log(`  ${c.bold}${item.slot}${c.reset}: ${item.uri}`);
     }
+  }
+  if (gated.provider) {
+    const provider = gated.provider;
+    console.log(`${c.yellow}Remote provider:${c.reset}`);
+    console.log(`  ${provider.base_url} (embed: ${provider.embed ?? "cohere.embed-v4:0"}, generate: ${provider.generate ?? "bedrock.claude-sonnet-5-5"}, dimensions: ${provider.embed_dimensions ?? 1536})`);
   }
 }
 
@@ -3961,7 +3966,7 @@ function showHelp(): void {
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
   console.log("    --contextual                - Prepend LLM-generated document context to each chunk before embedding");
-  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation/rerank models");
+  console.log("  qmd pull [--refresh] [--progress] - Download embedding/generation models");
   console.log("  qmd cleanup [--dry-run]       - Drop inactive docs/orphans, compact FTS, vacuum");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -4288,7 +4293,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   if (invalid.length > 0) {
     nextSteps.push("Run `qmd pull --refresh` to replace invalid cached model files, or delete the listed file and rerun `qmd pull`.");
   } else {
-    nextSteps.push("Run `qmd pull` to download missing embedding/generation/reranking models before `qmd embed` or `qmd query`.");
+    nextSteps.push("Run `qmd pull` to download missing embedding/generation models before `qmd embed` or `qmd query`.");
   }
 }
 

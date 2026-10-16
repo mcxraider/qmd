@@ -5,7 +5,7 @@
  * Uses inline config (no YAML files) to verify the SDK works self-contained.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdtemp, writeFile, mkdir, rm, rename } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -68,6 +68,58 @@ function freshDbPath(): string {
 // =============================================================================
 
 describe("createStore", () => {
+  test("rejects a provider without QMD_API_KEY before any request", async () => {
+    const previousKey = process.env.QMD_API_KEY;
+    const originalFetch = globalThis.fetch;
+    delete process.env.QMD_API_KEY;
+    const fetchSpy = vi.fn();
+    globalThis.fetch = fetchSpy as typeof fetch;
+    try {
+      await expect(createStore({
+        dbPath: freshDbPath(),
+        config: { collections: {}, models: { provider: { base_url: "https://example.invalid/models" } } },
+      })).rejects.toThrow("QMD_API_KEY is not set");
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (previousKey === undefined) delete process.env.QMD_API_KEY;
+      else process.env.QMD_API_KEY = previousKey;
+    }
+  });
+
+  test.each(["inline", "file"])("uses remote embeddings from %s provider config", async mode => {
+    const previousKey = process.env.QMD_API_KEY;
+    process.env.QMD_API_KEY = "test-key";
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: any }> = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      requests.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      const input = requests.at(-1)!.body.input as string[];
+      return new Response(JSON.stringify({ data: input.map((_, index) => ({ index, embedding: [1, 2, 3] })) }), { status: 200 });
+    }) as typeof fetch;
+    const config: CollectionConfig = {
+      collections: { docs: { path: docsDir, pattern: "**/*.md" } },
+      models: { provider: { base_url: "https://example.invalid/models", embed: "cohere.embed-v4:0", embed_dimensions: 3 } },
+    };
+    const configPath = join(testDir, `provider-${mode}.yml`);
+    if (mode === "file") writeFileSync(configPath, YAML.stringify(config));
+    let store: QMDStore | undefined;
+    try {
+      store = await createStore({ dbPath: freshDbPath(), ...(mode === "file" ? { configPath } : { config }) });
+      await store.internal.llm!.embedBatch(["document"]);
+      await store.internal.llm!.embedBatch(["query"], { isQuery: true });
+      expect(requests.map(request => request.body.input_type)).toEqual(["search_document", "search_query"]);
+      expect(requests.every(request => request.url === "https://example.invalid/models/v1/embeddings")).toBe(true);
+      expect(requests.every(request => request.body.output_dimension === 3)).toBe(true);
+      expect(store.internal.llm!.embedModelName).toBe("cohere.embed-v4:0");
+    } finally {
+      await store?.close();
+      globalThis.fetch = originalFetch;
+      if (previousKey === undefined) delete process.env.QMD_API_KEY;
+      else process.env.QMD_API_KEY = previousKey;
+    }
+  });
+
   test("uses remote embedding model for SDK and MCP index status", async () => {
     const previousKey = process.env.QMD_API_KEY;
     process.env.QMD_API_KEY = "test-key";

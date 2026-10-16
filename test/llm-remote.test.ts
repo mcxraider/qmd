@@ -2,20 +2,15 @@
  * Unit tests for RemoteLLM — the OpenAI-compatible API backend.
  *
  * Mocks global fetch to assert request shape and response mapping without any
- * network. Reranking/tokenizer delegate to a stub local backend.
+ * network. Tokenization delegates to a stub local backend.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { RemoteLLM } from "../src/llm-remote.js";
 import type { LlamaCpp } from "../src/llm.js";
 
-// Minimal local backend: only the members RemoteLLM delegates to.
+// Minimal local tokenizer: only the members RemoteLLM delegates to.
 const localStub = {
-  rerank: vi.fn(async (_q: string, docs: { file: string; text: string }[]) => ({
-    results: docs.map((d, i) => ({ ...d, score: 1 - i * 0.1, index: i })),
-    model: "local-reranker",
-  })),
-  rerankModelName: "local-reranker",
   tokenize: vi.fn(async () => []),
   detokenize: vi.fn(async () => ""),
   dispose: vi.fn(async () => {}),
@@ -28,7 +23,7 @@ function makeLLM() {
     embedModel: "cohere.embed-v4:0",
     generateModel: "bedrock.claude-sonnet-5",
     dimensions: 4,
-    localForRerank: localStub,
+    localTokenizer: localStub,
     timeoutMs: 1000,
   });
 }
@@ -76,6 +71,13 @@ describe("RemoteLLM.embed", () => {
     const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(body.input_type).toBe("search_query");
   });
+  test("sends input_type=search_query for query batches", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ data: [{ index: 0, embedding: [1] }, { index: 1, embedding: [2] }] }));
+    await makeLLM().embedBatch(["original", "hyde"], { isQuery: true });
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.input_type).toBe("search_query");
+    expect(body.input).toEqual(["original", "hyde"]);
+  });
 });
 
 describe("RemoteLLM.expandQuery", () => {
@@ -116,18 +118,9 @@ describe("RemoteLLM.postJSON retry", () => {
   });
 });
 
-describe("RemoteLLM.rerank", () => {
-  test("delegates to the local backend", async () => {
-    const out = await makeLLM().rerank("q", [{ file: "a", text: "x" }]);
-    expect(out.model).toBe("local-reranker");
-    expect(localStub.rerank).toHaveBeenCalled();
-  });
-});
-
 describe("RemoteLLM.warmUp", () => {
-  test("warms the local reranker only — no remote fetch", async () => {
+  test("does not load a local reranker or call the remote API", async () => {
     await makeLLM().warmUp();
-    expect(localStub.rerank).toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

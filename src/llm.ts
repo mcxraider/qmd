@@ -976,10 +976,9 @@ export class LlamaCpp implements LLM {
     return this.rerankModelUri;
   }
 
-  /** Warm the reranker before an HTTP daemon reports ready; embed/generate stay lazy. */
+  /** API reranker readiness is checked by TypeSafeLLM. */
   async warmUp(): Promise<void> {
-    const ranking = await this.rerank("readiness", [{ file: "warm-up", text: "QMD readiness check" }]);
-    if (ranking.model === "fallback") throw new Error("Reranking model warm-up failed");
+    // Local model loading remains lazy.
   }
 
   /**
