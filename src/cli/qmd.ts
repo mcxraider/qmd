@@ -5236,7 +5236,7 @@ if (isMain) {
             console.error(`QMD MCP daemon failed to warm up${spawnError ? `: ${spawnError.message}` : ""}. Check ${logPath}`);
             process.exit(1);
           }
-          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid}); reranker model ready`);
+          console.log(`Started on http://${host ?? "localhost"}:${port}/mcp (PID ${child.pid}); models warmed up`);
           console.log(`Logs: ${logPath}`);
           process.exit(0);
         }
