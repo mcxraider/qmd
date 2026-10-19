@@ -10,6 +10,7 @@ texts/
 .cursor/
 .github/copilot/
 *.md
+!knowledge-base/**/*.md
 !README.md
 !CLAUDE.md
 !DESIGN.md

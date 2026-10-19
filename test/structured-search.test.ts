@@ -322,6 +322,43 @@ describe("structuredSearch", () => {
     // vec and hyde require embeddings, so just test lex
   });
 
+  test("starts vector embedding before synchronous lexical search", async () => {
+    store.ensureVecTable(3);
+    const events: string[] = [];
+    const originalLlm = store.llm;
+    const originalSearchFTS = store.searchFTS;
+    const originalSearchVec = store.searchVec;
+    let releaseEmbedding: () => void = () => {};
+    const embeddingGate = new Promise<void>(resolve => { releaseEmbedding = resolve; });
+    store.llm = {
+      embedModelName: "test-embed-model",
+      embedBatch: async () => {
+        await Promise.resolve();
+        events.push("embedding started");
+        await embeddingGate;
+        return [{ embedding: [1, 0, 0], model: "test-embed-model" }];
+      },
+    } as any;
+    store.searchFTS = ((...args: Parameters<typeof originalSearchFTS>) => {
+      events.push("lexical search");
+      releaseEmbedding();
+      return originalSearchFTS(...args);
+    }) as typeof originalSearchFTS;
+    store.searchVec = vi.fn(async () => []);
+
+    try {
+      await structuredSearch(store, [
+        { type: "lex", query: "test" },
+        { type: "vec", query: "test semantic" },
+      ], { skipRerank: true });
+      expect(events).toEqual(["embedding started", "lexical search"]);
+    } finally {
+      store.llm = originalLlm;
+      store.searchFTS = originalSearchFTS;
+      store.searchVec = originalSearchVec;
+    }
+  });
+
   test("respects limit option", async () => {
     const results = await structuredSearch(store, [
       { type: "lex", query: "test" }

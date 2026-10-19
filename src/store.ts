@@ -6793,7 +6793,24 @@ export async function structuredSearch(
   // (undefined = all). searchFTS/searchVec merge per-collection results by score,
   // so the RRF weight below boosts the first search, not the first collection.
 
-  // Step 1: Run FTS for all lex searches (sync, instant)
+  // Start embedding before synchronous FTS; yield once so native embedding can run alongside it.
+  const vecSearches = hasVectors ? searches.filter(
+    (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
+      s.type === 'vec' || s.type === 'hyde'
+  ) : [];
+  const llm = vecSearches.length > 0 ? getLlm(store) : undefined;
+  const embedModel = llm?.embedModelName ?? "";
+  const embedStart = Date.now();
+  const embeddingsPromise = llm ? (() => {
+    const texts = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
+    hooks?.onEmbedStart?.(texts.length);
+    return llm.embedBatch(texts, { isQuery: true });
+  })() : undefined;
+  if (embeddingsPromise && searches.some(s => s.type === 'lex')) {
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+
+  // Step 1: Run FTS for all lex searches while vector embeddings are in flight.
   for (const search of searches) {
     if (search.type === 'lex') {
       const ftsResults = store.searchFTS(search.query, 20, collections, filter);
@@ -6812,41 +6829,30 @@ export async function structuredSearch(
     }
   }
 
-  // Step 2: Batch embed and run vector searches for vec/hyde
-  if (hasVectors) {
-    const vecSearches = searches.filter(
-      (s): s is ExpandedQuery & { type: 'vec' | 'hyde' } =>
-        s.type === 'vec' || s.type === 'hyde'
-    );
-    if (vecSearches.length > 0) {
-      const llm = getLlm(store);
-      const embedModel = llm.embedModelName;
-      const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
-      hooks?.onEmbedStart?.(textsToEmbed.length);
-      const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
-      hooks?.onEmbedDone?.(Date.now() - embedStart);
+  // Step 2: Join embeddings and run vector searches for vec/hyde.
+  if (embeddingsPromise) {
+    const embeddings = await embeddingsPromise;
+    hooks?.onEmbedDone?.(Date.now() - embedStart);
 
-      for (let i = 0; i < vecSearches.length; i++) {
-        const embedding = embeddings[i]?.embedding;
-        if (!embedding) continue;
+    for (let i = 0; i < vecSearches.length; i++) {
+      const embedding = embeddings[i]?.embedding;
+      if (!embedding) continue;
 
-        const vecResults = await store.searchVec(
-          vecSearches[i]!.query, embedModel, 20, collections,
-          undefined, embedding, filter
-        );
-        if (vecResults.length > 0) {
-          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(vecResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-          rankedListMeta.push({
-            source: "vec",
-            queryType: vecSearches[i]!.type,
-            query: vecSearches[i]!.query,
-          });
-        }
+      const vecResults = await store.searchVec(
+        vecSearches[i]!.query, embedModel, 20, collections,
+        undefined, embedding, filter
+      );
+      if (vecResults.length > 0) {
+        for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(vecResults.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+        rankedListMeta.push({
+          source: "vec",
+          queryType: vecSearches[i]!.type,
+          query: vecSearches[i]!.query,
+        });
       }
     }
   }

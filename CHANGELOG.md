@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Start structured-search vector embeddings before synchronous lexical search so
+  both can run concurrently.
 - `qmd doctor` selects vector sample identities before loading document bodies,
   avoiding excessive SQLite memory use on large indexes with duplicate paths.
   #978 (thanks @naveenspark)
